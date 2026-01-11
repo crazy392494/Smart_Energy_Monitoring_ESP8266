@@ -1,0 +1,200 @@
+#define BLYNK_TEMPLATE_ID "id"
+#define BLYNK_TEMPLATE_NAME "name"
+#define BLYNK_AUTH_TOKEN "blynk_token"
+
+#include <ESP8266WiFi.h>
+#include <BlynkSimpleEsp8266.h>
+#include <PZEM004Tv30.h>
+
+// ---- WiFi ----
+char ssid[] = "wifi_name";      
+char pass[] = "wifi_pass";         
+
+// ---- PZEM004T ----
+PZEM004Tv30 pzem(D6, D7);
+
+// ---- Timer ----
+BlynkTimer timer;
+
+// ---- Relay Pin ----
+#define RELAY_PIN D1   
+
+// ---- Load thresholds for relay control ----
+#define CURRENT_THRESHOLD 0.05
+#define POWER_THRESHOLD   1.0    
+
+// ---- Relay / Timer State ----
+int userTimerMinutes = 0;   
+bool relayOn = false;
+bool timerActive = false;         
+unsigned long relayStart = 0;
+unsigned long relayDuration = 0;  
+
+// ---- Auto cutoff / Load detection ----
+unsigned long noLoadStart = 0;
+bool noLoadDetected = false;
+
+// ----------------- FUNCTIONS -----------------
+void readPZEM() {
+  float voltage = pzem.voltage();
+  float current = pzem.current();
+  float power   = pzem.power();
+  float energy  = pzem.energy();
+
+  if (isnan(voltage)) voltage = 0;
+  if (isnan(current)) current = 0;
+  if (isnan(power))   power = 0;
+  if (isnan(energy))  energy = 0;
+
+  // ------------------ Tiny current correction ------------------
+  // Only if relay is ON, otherwise show 0
+  if (!relayOn) {
+    current = 0;
+  } else if (current == 0 && voltage > 0) {
+    current = 0.01; // show tiny current if relay ON
+  }
+
+  // ---------------- Display ----------------
+  Serial.print("V: "); Serial.print(voltage, 2);
+  Serial.print(" | I: "); Serial.print(current, 2);
+  Serial.print(" | P: "); Serial.print(power, 2);
+  Serial.print(" | E: "); Serial.print(energy, 2);
+
+  Blynk.virtualWrite(V2, voltage);
+  Blynk.virtualWrite(V3, current);  
+  Blynk.virtualWrite(V4, power);
+  Blynk.virtualWrite(V5, energy);
+
+  // ------------------ Auto-load Relay ------------------
+  if (!relayOn && !timerActive) { 
+    if (current >= CURRENT_THRESHOLD || power >= POWER_THRESHOLD) {
+      digitalWrite(RELAY_PIN, LOW);
+      relayOn = true;
+      noLoadDetected = false;
+      Blynk.virtualWrite(V1, 1); // update switch
+      Serial.println(" | Relay ON (auto - load detected)");
+    }
+  }
+
+  // ------------------ Auto cutoff ------------------
+  if (relayOn && !timerActive) {
+    if (current < CURRENT_THRESHOLD && power < POWER_THRESHOLD) {
+      if (!noLoadDetected) {
+        noLoadDetected = true;
+        noLoadStart = millis();
+      } else if (millis() - noLoadStart >= 5000) {
+        digitalWrite(RELAY_PIN, HIGH);
+        relayOn = false;
+        noLoadDetected = false;
+        Blynk.virtualWrite(V1, 0);  // update switch in app
+        Serial.println(" | Relay OFF (auto - no load 5s)");
+      }
+    } else {
+      noLoadDetected = false;
+    }
+  }
+
+  // ------------------ Timer Remaining ------------------
+  if (relayOn && timerActive && userTimerMinutes > 0) {
+    long elapsed = millis() - relayStart;
+    long remainingMs = relayDuration - elapsed;
+    if (remainingMs < 0) remainingMs = 0;
+    int remainingSec = remainingMs / 1000;
+    Blynk.virtualWrite(V7, remainingSec);
+
+    int min = remainingSec / 60;
+    int sec = remainingSec % 60;
+    Serial.print(" | Remaining Time: ");
+    if (min < 10) Serial.print("0");
+    Serial.print(min);
+    Serial.print(":");
+    if (sec < 10) Serial.print("0");
+    Serial.print(sec);
+  } else {
+    Blynk.virtualWrite(V7, 0);
+    Serial.print(" | Remaining Time: 00:00");
+  }
+
+  Serial.println();
+}
+
+// ------------------ Manual Relay (V1) ------------------
+BLYNK_WRITE(V1) {
+  int value = param.asInt();
+  if (value == 1) {
+    digitalWrite(RELAY_PIN, LOW);  
+    relayOn = true;
+    timerActive = false;
+    noLoadDetected = false;
+    Serial.println("Relay ON (manual)");
+  } else {
+    digitalWrite(RELAY_PIN, HIGH);
+    relayOn = false;
+    timerActive = false;
+    noLoadDetected = false;
+    Blynk.virtualWrite(V7, 0);
+    Serial.println("Relay OFF (manual)");
+  }
+}
+
+// ------------------ Timer Control (V6) ------------------
+BLYNK_WRITE(V6) {
+  userTimerMinutes = param.asInt();
+  Serial.print("User set timer: "); Serial.print(userTimerMinutes); Serial.println(" min");
+
+  if (userTimerMinutes > 0) {
+    digitalWrite(RELAY_PIN, LOW);  
+    relayOn = true;
+    timerActive = true;    
+    relayStart = millis();
+    relayDuration = userTimerMinutes * 60000UL;
+    noLoadDetected = false;
+    Blynk.virtualWrite(V1, 1);
+    Serial.println("Relay ON (auto start by timer)");
+  } else {
+    digitalWrite(RELAY_PIN, HIGH);
+    relayOn = false;
+    timerActive = false;
+    noLoadDetected = false;
+    Blynk.virtualWrite(V1, 0); 
+    Blynk.virtualWrite(V7, 0);
+    Serial.println("Relay OFF (timer set to 0)");
+  }
+}
+
+// ------------------ Check Timer Expiry ------------------
+void checkTimer() {
+  if (relayOn && timerActive && userTimerMinutes > 0) {
+    if (millis() - relayStart >= relayDuration) {
+      digitalWrite(RELAY_PIN, HIGH); 
+      relayOn = false;
+      timerActive = false;
+      noLoadDetected = false;
+      Blynk.virtualWrite(V1, 0); 
+      Blynk.virtualWrite(V7, 0);
+      Serial.println("Relay OFF (timer expired)");
+    }
+  }
+}
+
+// ------------------ Setup ------------------
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, HIGH);
+
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+
+  timer.setInterval(1000L, readPZEM);
+  timer.setInterval(1000L, checkTimer);
+
+  Serial.println("System started...");
+}
+
+// ------------------ Loop ------------------
+void loop() {
+  Blynk.run();
+  timer.run();
+}
